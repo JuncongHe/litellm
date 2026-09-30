@@ -1,4 +1,14 @@
+import json
+from collections.abc import Mapping
+from functools import partial
+from typing import Final
+
+import httpx
+import pytest
+from pydantic import TypeAdapter
+
 import litellm
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
 
 
@@ -564,3 +574,137 @@ class TestDeepSeekThinkingParams:
         assert result["tools"] == [{"type": "function", "function": {"name": "get_weather"}}]
         assert "tool_choice" not in result
         assert result["parallel_tool_calls"] is True
+
+
+@pytest.mark.parametrize("effort", ("low", "high", "max", "minimal", "medium", "xhigh", "ultra"))
+@pytest.mark.parametrize(
+    "thinking", (None, {"type": "enabled"}, {"type": "enabled", "budget_tokens": 2048}, {"type": "invalid"})
+)
+def test_reasoning_effort_is_preserved_when_thinking_is_enabled(
+    effort: str, thinking: Mapping[str, object] | None
+) -> None:
+    result: Final = DeepSeekChatConfig().map_openai_params(
+        non_default_params={
+            "reasoning_effort": effort,
+            "max_tokens": 128,
+            "temperature": 0.3,
+            **({"thinking": dict(thinking)} if thinking is not None else {}),
+        },
+        optional_params={},
+        model="deepseek-v4-pro",
+        drop_params=False,
+    )
+    assert result == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": effort,
+        "max_tokens": 128,
+        "temperature": 0.3,
+    }
+
+
+@pytest.mark.parametrize("effort", ("low", "high", "max", "minimal", "medium", "xhigh", "ultra"))
+def test_disabled_thinking_takes_precedence_over_reasoning_effort(effort: str) -> None:
+    result: Final = DeepSeekChatConfig().map_openai_params(
+        non_default_params={"reasoning_effort": effort, "thinking": {"type": "disabled"}},
+        optional_params={},
+        model="deepseek-v4-pro",
+        drop_params=False,
+    )
+    assert result == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    (
+        ({}, {}),
+        ({"reasoning_effort": None}, {}),
+        ({"reasoning_effort": "none"}, {"thinking": {"type": "disabled"}}),
+        ({"thinking": {"type": "enabled"}}, {"thinking": {"type": "enabled"}}),
+        ({"thinking": {"type": "enabled"}, "reasoning_effort": None}, {"thinking": {"type": "enabled"}}),
+        ({"thinking": {"type": "enabled"}, "reasoning_effort": "none"}, {"thinking": {"type": "enabled"}}),
+        ({"thinking": {"type": "disabled"}, "reasoning_effort": "none"}, {"thinking": {"type": "disabled"}}),
+        ({"thinking": {"type": "invalid"}, "reasoning_effort": "none"}, {"thinking": {"type": "disabled"}}),
+    ),
+)
+def test_unset_reasoning_effort_is_not_forwarded(params: Mapping[str, object], expected: Mapping[str, object]) -> None:
+    result: Final = DeepSeekChatConfig().map_openai_params(
+        non_default_params=dict(params), optional_params={}, model="deepseek-v4-pro", drop_params=False
+    )
+    assert result == expected
+
+
+def _deepseek_effort_reply(request: httpx.Request, *, effort: str, stream: bool) -> httpx.Response:
+    body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+    assert body == {
+        "model": "deepseek-v4-pro",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": effort,
+        "max_tokens": 128,
+        "stream": stream,
+    }
+    reply: Final = {
+        "id": "deepseek-effort-test",
+        "object": "chat.completion.chunk" if stream else "chat.completion",
+        "created": 0,
+        "model": "deepseek-v4-pro",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "delta" if stream else "message": {"role": "assistant", "content": "ok"},
+            }
+        ],
+    }
+    if stream:
+        return httpx.Response(
+            200, text=f"data: {json.dumps(reply)}\n\ndata: [DONE]\n\n", headers={"content-type": "text/event-stream"}
+        )
+    return httpx.Response(200, json=reply)
+
+
+@pytest.mark.parametrize("effort", ("low", "high", "max"))
+@pytest.mark.parametrize("stream", (False, True))
+def test_completion_serializes_deepseek_reasoning_effort(effort: str, stream: bool) -> None:
+    transport: Final = httpx.MockTransport(partial(_deepseek_effort_reply, effort=effort, stream=stream))
+    with httpx.Client(transport=transport) as http_client:
+        response: Final = litellm.completion(
+            model="deepseek/deepseek-v4-pro",
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="test-key",
+            reasoning_effort=effort,
+            max_tokens=128,
+            stream=stream,
+            client=HTTPHandler(client=http_client),
+        )
+        if stream:
+            assert isinstance(response, litellm.CustomStreamWrapper)
+            assert "".join(chunk.choices[0].delta.content or "" for chunk in response) == "ok"
+        else:
+            assert isinstance(response, litellm.ModelResponse)
+            assert response.choices[0].message.content == "ok"
+
+
+@pytest.mark.parametrize("effort", ("low", "high", "max"))
+@pytest.mark.parametrize("stream", (False, True))
+async def test_acompletion_serializes_deepseek_reasoning_effort(effort: str, stream: bool) -> None:
+    client: Final = AsyncHTTPHandler(
+        transport=httpx.MockTransport(partial(_deepseek_effort_reply, effort=effort, stream=stream))
+    )
+    async with client.client:
+        response: Final = await litellm.acompletion(
+            model="deepseek/deepseek-v4-pro",
+            messages=[{"role": "user", "content": "hi"}],
+            api_key="test-key",
+            reasoning_effort=effort,
+            max_tokens=128,
+            stream=stream,
+            client=client,
+        )
+        if stream:
+            assert isinstance(response, litellm.CustomStreamWrapper)
+            chunks: Final = tuple([chunk async for chunk in response])
+            assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "ok"
+        else:
+            assert isinstance(response, litellm.ModelResponse)
+            assert response.choices[0].message.content == "ok"

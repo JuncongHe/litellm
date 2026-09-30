@@ -59,6 +59,9 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         elif reasoning_effort is not None:
             optional_params["thinking"] = {"type": "disabled" if reasoning_effort == "none" else "enabled"}
 
+        if reasoning_effort not in (None, "none") and optional_params["thinking"]["type"] == "enabled":
+            return {**optional_params, "reasoning_effort": reasoning_effort}  # mutable-ok: base transform pops params
+
         return optional_params
 
     def _fill_reasoning_content(self, messages: list[AllMessageValues]) -> list[AllMessageValues]:
