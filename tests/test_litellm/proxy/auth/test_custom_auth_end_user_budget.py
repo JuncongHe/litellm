@@ -5,7 +5,11 @@ from litellm.proxy.auth.user_api_key_auth import (
     _run_post_custom_auth_checks,
     update_valid_token_with_end_user_params,
 )
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import (
+    LiteLLM_BudgetTable,
+    LiteLLM_EndUserTable,
+    UserAPIKeyAuth,
+)
 
 
 @pytest.mark.asyncio
@@ -88,6 +92,247 @@ async def test_custom_auth_run_post_custom_auth_checks_with_end_user_budget_exce
             mock_budget_check.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_custom_auth_enforces_end_user_budget_when_common_checks_skipped():
+    # custom-auth deployments with custom_auth_run_common_checks unset skip
+    # common_checks() (and its end-user budget enforcement) in the centralized
+    # gate, so the helper must enforce the end-user budget itself. Regression:
+    # an over-budget end user must be rejected on this path.
+    valid_token = UserAPIKeyAuth(token="test_token", end_user_id="customer-1")
+    over_budget_end_user = LiteLLM_EndUserTable(
+        user_id="customer-1",
+        blocked=False,
+        spend=0.0,
+        litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
+    )
+
+    async def mock_get_current_spend(
+        counter_key, fallback_spend, max_budget=None, **kwargs
+    ):
+        if counter_key == "spend:end_user:customer-1":
+            return 5.0
+        return fallback_spend
+
+    with (
+        patch(
+            "litellm.proxy.auth.user_api_key_auth.get_end_user_object",
+            new_callable=AsyncMock,
+            return_value=over_budget_end_user,
+        ),
+        patch("litellm.proxy.proxy_server.get_current_spend", mock_get_current_spend),
+        patch("litellm.proxy.proxy_server.general_settings", {}),
+    ):
+        with pytest.raises(litellm.BudgetExceededError):
+            await _run_post_custom_auth_checks(
+                valid_token=valid_token,
+                request=None,
+                request_data={"model": "gpt-4"},
+                route="/v1/chat/completions",
+                parent_otel_span=None,
+            )
+
+
+@pytest.mark.asyncio
+async def test_custom_auth_defers_end_user_budget_to_common_checks_when_enabled():
+    # With custom_auth_run_common_checks set, the wrapper's common_checks()
+    # enforces the end-user budget, so the helper must not double-enforce it.
+    valid_token = UserAPIKeyAuth(token="test_token", end_user_id="customer-1")
+    end_user_obj = LiteLLM_EndUserTable(
+        user_id="customer-1",
+        blocked=False,
+        spend=0.0,
+        litellm_budget_table=LiteLLM_BudgetTable(max_budget=1.0),
+    )
+
+    with (
+        patch(
+            "litellm.proxy.auth.user_api_key_auth.get_end_user_object",
+            new_callable=AsyncMock,
+            return_value=end_user_obj,
+        ),
+        patch(
+            "litellm.proxy.auth.user_api_key_auth._check_end_user_budget",
+            new_callable=AsyncMock,
+        ) as mock_check,
+        patch(
+            "litellm.proxy.auth.user_api_key_auth._enforce_key_and_fallback_model_access",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "litellm.proxy.proxy_server.general_settings",
+            {"custom_auth_run_common_checks": True},
+        ),
+    ):
+        await _run_post_custom_auth_checks(
+            valid_token=valid_token,
+            request=None,
+            request_data={"model": "gpt-4"},
+            route="/v1/chat/completions",
+            parent_otel_span=None,
+        )
+        mock_check.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_custom_auth_token_budget_still_loads_and_caches_unrestricted_end_user():
+    """
+    A token-supplied end_user_max_budget must leave the end-user row in cache.
+
+    Custom auth can set that budget for a customer whose own row carries no budget, block, region
+    or permission, which keeps the row out of the cached restricted-id registry that lets auth skip
+    the read. The end-user spend counter seeds from this cache entry, so skipping the read would
+    cold-start the counter at 0 and under-count a customer who has already spent 100.
+    """
+    from unittest.mock import MagicMock
+
+    from litellm.proxy.auth.user_api_key_auth import _lookup_end_user_and_apply_budget
+    from litellm.proxy.common_utils.user_api_key_cache import (
+        UserApiKeyCache,
+        end_user_cache_key,
+    )
+
+    end_user_row = MagicMock()
+    end_user_row.user_id = "customer-1"
+    end_user_row.dict = lambda: {
+        "user_id": "customer-1",
+        "blocked": False,
+        "spend": 100.0,
+    }
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_endusertable.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.litellm_endusertable.find_unique = AsyncMock(return_value=end_user_row)
+    cache = UserApiKeyCache()
+
+    _, end_user_object = await _lookup_end_user_and_apply_budget(
+        valid_token=UserAPIKeyAuth(
+            token="test_token",
+            end_user_id="customer-1",
+            end_user_max_budget=50.0,
+        ),
+        route="/v1/chat/completions",
+        parent_otel_span=None,
+        prisma_client=mock_prisma,
+        user_api_key_cache=cache,
+        proxy_logging_obj=MagicMock(),
+    )
+
+    assert end_user_object is not None
+    assert end_user_object.spend == 100.0
+    assert await cache.async_get_cache(key=end_user_cache_key("customer-1")) is not None
+
+
+@pytest.mark.asyncio
+async def test_custom_auth_key_default_end_user_budget_reaches_the_token_for_a_new_end_user(monkeypatch):
+    """A custom-auth token that carries a key ``end_user_budget_id`` must enforce that budget on a
+    brand-new end user, ahead of the proxy-wide default, from the very first request."""
+    from unittest.mock import MagicMock
+
+    from litellm.proxy.auth.user_api_key_auth import _lookup_end_user_and_apply_budget
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    monkeypatch.setattr(litellm, "max_end_user_budget_id", "global-eu-budget")
+    budgets = {"global-eu-budget": 100.0, "svc-a-budget": 0.5}
+
+    async def _find_budget(where):
+        row = MagicMock()
+        row.dict = lambda: {"budget_id": where["budget_id"], "max_budget": budgets[where["budget_id"]]}
+        return row
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_endusertable.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.litellm_endusertable.find_unique = AsyncMock(return_value=None)
+    mock_prisma.db.litellm_budgettable.find_unique = AsyncMock(side_effect=_find_budget)
+
+    valid_token, end_user_object = await _lookup_end_user_and_apply_budget(
+        valid_token=UserAPIKeyAuth(
+            token="test_token",
+            end_user_id="customer-new",
+            metadata={"end_user_budget_id": "svc-a-budget"},
+        ),
+        route="/v1/chat/completions",
+        parent_otel_span=None,
+        prisma_client=mock_prisma,
+        user_api_key_cache=UserApiKeyCache(),
+        proxy_logging_obj=MagicMock(),
+    )
+
+    assert end_user_object is None
+    assert valid_token.end_user_max_budget == 0.5
+
+
+@pytest.mark.asyncio
+async def test_custom_auth_cap_stays_below_the_key_default_end_user_budget(monkeypatch):
+    """A custom auth callable that already capped the end user tighter than the key's default
+    budget keeps its cap: the key default never loosens what custom auth set."""
+    from unittest.mock import MagicMock
+
+    from litellm.proxy.auth.user_api_key_auth import _lookup_end_user_and_apply_budget
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    monkeypatch.setattr(litellm, "max_end_user_budget_id", None)
+
+    async def _find_budget(where):
+        row = MagicMock()
+        row.dict = lambda: {"budget_id": where["budget_id"], "max_budget": 0.5}
+        return row
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_endusertable.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.litellm_endusertable.find_unique = AsyncMock(return_value=None)
+    mock_prisma.db.litellm_budgettable.find_unique = AsyncMock(side_effect=_find_budget)
+
+    valid_token, _ = await _lookup_end_user_and_apply_budget(
+        valid_token=UserAPIKeyAuth(
+            token="test_token",
+            end_user_id="customer-new",
+            end_user_max_budget=0.1,
+            metadata={"end_user_budget_id": "svc-a-budget"},
+        ),
+        route="/v1/chat/completions",
+        parent_otel_span=None,
+        prisma_client=mock_prisma,
+        user_api_key_cache=UserApiKeyCache(),
+        proxy_logging_obj=MagicMock(),
+    )
+
+    assert valid_token.end_user_max_budget == 0.1
+
+
+@pytest.mark.asyncio
+async def test_custom_auth_proxy_wide_default_end_user_budget_reaches_an_uncapped_token(monkeypatch):
+    """With no key default, a brand-new end user on a custom-auth token that set no cap gets the
+    proxy-wide default budget's cap, the same way the virtual-key path already applies it."""
+    from unittest.mock import MagicMock
+
+    from litellm.proxy.auth.user_api_key_auth import _lookup_end_user_and_apply_budget
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    monkeypatch.setattr(litellm, "max_end_user_budget_id", "global-eu-budget")
+
+    async def _find_budget(where):
+        row = MagicMock()
+        row.dict = lambda: {"budget_id": where["budget_id"], "max_budget": 100.0}
+        return row
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_endusertable.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.litellm_endusertable.find_unique = AsyncMock(return_value=None)
+    mock_prisma.db.litellm_budgettable.find_unique = AsyncMock(side_effect=_find_budget)
+
+    valid_token, end_user_object = await _lookup_end_user_and_apply_budget(
+        valid_token=UserAPIKeyAuth(token="test_token", end_user_id="customer-new"),
+        route="/v1/chat/completions",
+        parent_otel_span=None,
+        prisma_client=mock_prisma,
+        user_api_key_cache=UserApiKeyCache(),
+        proxy_logging_obj=MagicMock(),
+    )
+
+    assert end_user_object is None
+    assert valid_token.end_user_max_budget == 100.0
+
+
 def test_update_valid_token_does_not_override_custom_auth_values_with_none():
     """
     Greptile feedback: if custom auth sets end_user_model_max_budget on the token,
@@ -143,3 +388,18 @@ def test_update_valid_token_db_values_override_custom_auth_when_set():
     # DB values should win
     assert result.end_user_tpm_limit == 500
     assert result.end_user_model_max_budget == db_budget
+
+
+def test_end_user_budget_tpd_limit_reaches_the_token():
+    from litellm.proxy.auth.user_api_key_auth import _apply_budget_limits_to_end_user_params
+
+    end_user_params = {"end_user_id": "user_1"}
+    _apply_budget_limits_to_end_user_params(
+        end_user_params=end_user_params,
+        budget_info=LiteLLM_BudgetTable(rpm_limit=5, tpd_limit=750000),
+        end_user_id="user_1",
+    )
+    result = update_valid_token_with_end_user_params(UserAPIKeyAuth(token="test_token"), end_user_params)
+
+    assert result.end_user_rpm_limit == 5
+    assert result.end_user_tpd_limit == 750000

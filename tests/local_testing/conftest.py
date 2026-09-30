@@ -11,27 +11,31 @@
 # these true defaults before every test, preventing cross-test contamination
 # under xdist where module reload is skipped.
 
+import asyncio
 import importlib
 import os
-import sys
 
 import pytest
 
-sys.path.insert(
-    0, os.path.abspath("../..")
-)  # Adds the parent directory to the system path
 import litellm
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.utils import _invalidate_model_cost_lowercase_map
 
-# ``litellm.model_cost`` is loaded at import time from the URL pinned to
-# ``main`` (``LITELLM_MODEL_COST_MAP_URL``).  The in-tree backup ships with
-# this branch and can include pricing entries that main has not yet picked
-# up (e.g. an upstream provider rotates a model id and the test cassette
-# records the new name).  Backfill any entries that are missing from the
-# remote-fetched map so cost-calculator lookups in tests succeed against
-# the cassette state the branch is being tested with.
-from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+# ``litellm.model_cost`` is loaded at import time from the URL pinned to ``main``
+# (``LITELLM_MODEL_COST_MAP_URL``).  The in-tree backup ships with this branch
+# and can include pricing entries that ``main`` has not yet picked up (e.g.
+# Mistral now returns ``ministral-8b-2512`` from ``mistral-tiny`` and the entry
+# was added on this branch).  Backfill any entries that are missing from the
+# remote-fetched map so cost-calculator lookups in tests succeed against the
+# cassette state the branch is being tested with.
+from litellm.litellm_core_utils.get_model_cost_map import (
+    RESERVED_TOP_LEVEL_KEYS,
+    GetModelCostMap,
+)
 
 for _k, _v in GetModelCostMap.load_local_model_cost_map().items():
+    if _k in RESERVED_TOP_LEVEL_KEYS:
+        continue
     litellm.model_cost.setdefault(_k, _v)
 
 from tests._vcr_conftest_common import (  # noqa: E402,F401
@@ -47,6 +51,14 @@ from tests._vcr_conftest_common import (  # noqa: E402,F401
     reset_vcr_diag_dir,
     vcr_config_dict,
 )
+from tests.fake_openai_endpoint import ensure_fake_openai_endpoint  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def fake_openai_endpoint():
+    ensure_fake_openai_endpoint()
+    yield
+
 
 # Per-item respx detection (``apply_vcr_auto_marker_to_items``) auto-skips
 # tests whose ``@pytest.mark.respx`` marker or ``respx_mock`` fixture
@@ -57,14 +69,16 @@ from tests._vcr_conftest_common import (  # noqa: E402,F401
 # blacklisting was masking valid cache opportunities.
 
 # Files where VCR replay breaks the test:
-# - ``test_assistants.py``: polls fresh per-session run IDs that no cassette
-#   can match, so every CI run re-records and the suite times out.
 # - ``test_router_caching.py``: asserts upstream returns a *new* id per call,
 #   which a deterministic cassette replay violates.
 _VCR_INCOMPATIBLE_FILES = frozenset(
     {
-        "test_assistants.py",
         "test_router_caching.py",
+        # Hits the local fake OpenAI endpoint on 127.0.0.1; nothing to record.
+        "test_fake_openai_endpoint.py",
+        # Needs the real connection pool a collected handler tears down; vcrpy
+        # patches the transport that pool lives in.
+        "test_handler_gc_does_not_close_client.py",
     }
 )
 
@@ -212,12 +226,14 @@ def isolate_litellm_state():
     yield
 
     # ---- Teardown: restore saved state ----
+    asyncio.run(GLOBAL_LOGGING_WORKER.clear_queue())
     if hasattr(litellm, "in_memory_llm_clients_cache"):
         litellm.in_memory_llm_clients_cache.flush_cache()
 
     for attr, original_value in original_state.items():
         if hasattr(litellm, attr):
             setattr(litellm, attr, original_value)
+    _invalidate_model_cost_lowercase_map()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -226,7 +242,6 @@ def setup_and_teardown():
     Module-scoped setup. Reloads litellm only in single-process mode
     (skipped under xdist to avoid cross-worker interference).
     """
-    sys.path.insert(0, os.path.abspath("../.."))
 
     import litellm
 
